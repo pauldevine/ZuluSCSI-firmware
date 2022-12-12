@@ -15,9 +15,12 @@ extern "C" {
 // As of 2022-09-13, the platformio RP2040 core is missing cplusplus guard on flash.h
 // For that reason this has to be inside the extern "C" here.
 #include <hardware/flash.h>
+#include "rp2040_flash_do_cmd.h"
 
 const char *g_azplatform_name = PLATFORM_NAME;
 static bool g_scsi_initiator = false;
+static uint32_t g_flash_chip_size = 0;
+static bool g_uart_initialized = false;
 
 void mbed_error_hook(const mbed_error_ctx * error_context);
 
@@ -63,7 +66,11 @@ void azplatform_init()
     /* Initialize logging to SWO pin (UART0) */
     gpio_conf(SWO_PIN,        GPIO_FUNC_UART,false,false, true,  false, true);
     uart_init(uart0, 1000000);
+    g_uart_initialized = true;
     mbed_set_error_hook(mbed_error_hook);
+
+    azlog("Platform: ", g_azplatform_name);
+    azlog("FW Version: ", g_azlog_firmwareversion);
 
     azlog("DIP switch settings: debug log ", (int)dbglog, ", termination ", (int)termination);
 
@@ -77,6 +84,13 @@ void azplatform_init()
     {
         azlog("NOTE: SCSI termination is disabled");
     }
+
+    // Get flash chip size
+    uint8_t cmd_read_jedec_id[4] = {0x9f, 0, 0, 0};
+    uint8_t response_jedec[4] = {0};
+    flash_do_cmd(cmd_read_jedec_id, response_jedec, 4);
+    g_flash_chip_size = (1 << response_jedec[3]);
+    azlog("Flash chip size: ", (int)(g_flash_chip_size / 1024), " kB");
 
     // SD card pins
     // Card is used in SDIO mode for main program, and in SPI mode for crash handler & bootloader.
@@ -144,7 +158,7 @@ void azplatform_late_init()
     else
     {
         g_scsi_initiator = false;
-        azlog("SCSI target mode selected by DIP switch, acting as an SCSI disk");
+        azlog("SCSI target/disk mode selected by DIP switch, acting as a SCSI disk");
     }
 
     /* Initialize SCSI pins to required modes.
@@ -295,7 +309,10 @@ void mbed_error_hook(const mbed_error_ctx * error_context)
 // This function is called for every log message.
 void azplatform_log(const char *s)
 {
-    uart_puts(uart0, s);
+    if (g_uart_initialized)
+    {
+        uart_puts(uart0, s);
+    }
 }
 
 static int g_watchdog_timeout;
@@ -454,6 +471,73 @@ void btldr_reset_handler()
 // The rp2040_btldr.ld places real vector table at an offset.
 __attribute__((section(".btldr_vectors")))
 const void * btldr_vectors[2] = {&__StackTop, (void*)&btldr_reset_handler};
+
+#endif
+
+/************************************/
+/* ROM drive in extra flash space   */
+/************************************/
+
+#ifdef PLATFORM_HAS_ROM_DRIVE
+
+// Reserve up to 352 kB for firmware.
+#define ROMDRIVE_OFFSET (352 * 1024)
+
+uint32_t azplatform_get_romdrive_maxsize()
+{
+    if (g_flash_chip_size >= ROMDRIVE_OFFSET)
+    {
+        return g_flash_chip_size - ROMDRIVE_OFFSET;
+    }
+    else
+    {
+        // Failed to read flash chip size, default to 2 MB
+        return 2048 * 1024 - ROMDRIVE_OFFSET;
+    }
+}
+
+bool azplatform_read_romdrive(uint8_t *dest, uint32_t start, uint32_t count)
+{
+    xip_ctrl_hw->stream_ctr = 0;
+
+    while (!(xip_ctrl_hw->stat & XIP_STAT_FIFO_EMPTY))
+    {
+        (void) xip_ctrl_hw->stream_fifo;
+    }
+
+    xip_ctrl_hw->stream_addr = start + ROMDRIVE_OFFSET;
+    xip_ctrl_hw->stream_ctr = count / 4;
+
+    // Transfer happens in multiples of 4 bytes
+    assert(start < azplatform_get_romdrive_maxsize());
+    assert((count & 3) == 0);
+    assert((((uint32_t)dest) & 3) == 0);
+
+    uint32_t *dest32 = (uint32_t*)dest;
+    uint32_t words_remain = count / 4;
+    while (words_remain > 0)
+    {
+        if (!(xip_ctrl_hw->stat & XIP_STAT_FIFO_EMPTY))
+        {
+            *dest32++ = xip_ctrl_hw->stream_fifo;
+            words_remain--;
+        }
+    }
+
+    return true;
+}
+
+bool azplatform_write_romdrive(const uint8_t *data, uint32_t start, uint32_t count)
+{
+    assert(start < azplatform_get_romdrive_maxsize());
+    assert((count % AZPLATFORM_ROMDRIVE_PAGE_SIZE) == 0);
+
+    __disable_irq();
+    flash_range_erase(start + ROMDRIVE_OFFSET, count);
+    flash_range_program(start + ROMDRIVE_OFFSET, data, count);
+    __enable_irq();
+    return true;
+}
 
 #endif
 
