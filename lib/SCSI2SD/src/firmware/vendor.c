@@ -75,6 +75,18 @@ int scsiVendorCommand()
 		// XEBEC S1410 controller
 		// Stub, return success
 	}
+	else if (command == 0x0F)
+	{
+		// Write Sector Buffer
+		// XEBEC S1410 controller
+		// Stub, return success
+	}
+	else if (command == 0x10)
+	{
+		// Read Sector Buffer
+		// XEBEC S1410 controller
+		// Stub, return success
+	}
 	else
 	{
 		commandHandled = 0;
